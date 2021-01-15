@@ -6,7 +6,6 @@ function BackendPricesUpdate()
 
 	market_set_default('c-cex', 'DCR', 'disabled', true); // no deposit
 	market_set_default('yobit', 'DCR', 'disabled', true); // no withdraw
-	market_set_default('bter', 'SFR', 'disabled', true);
 
 	settings_prefetch_all();
 
@@ -15,6 +14,7 @@ function BackendPricesUpdate()
 	updatePoloniexMarkets();
 	updateBleutradeMarkets();
 	updateCryptoBridgeMarkets();
+	updateEscoDexMarkets();
 	updateGateioMarkets();
 	updateGraviexMarkets();
 	updateKrakenMarkets();
@@ -27,7 +27,6 @@ function BackendPricesUpdate()
 	updateYobitMarkets();
 	updateAlcurexMarkets();
 	updateBinanceMarkets();
-	updateBterMarkets();
 	//updateEmpoexMarkets();
 	updateJubiMarkets();
 	updateLiveCoinMarkets();
@@ -367,6 +366,49 @@ function updateCryptoBridgeMarkets($force = false)
 		$market->save();
 
 		//debuglog("$exchange: update $symbol: {$market->price} {$market->price2}");
+	}
+}
+
+function updateEscoDexMarkets($force = false)
+{
+	$exchange = 'escodex';
+	if (exchange_get($exchange, 'disabled')) return;
+
+	$count = (int) dboscalar("SELECT count(id) FROM markets WHERE name LIKE '$exchange%'");
+	if ($count == 0) return;
+	$result = escodex_api_query('ticker');
+	if(!is_array($result)) return;
+	foreach($result as $ticker)
+	{
+		if (is_null(objSafeVal($ticker,'id'))) continue;
+		#$pairs = explode('_', $ticker->id);
+		$symbol = $ticker->quote; $base = $ticker->base;
+		if($symbol == 'BTC' || $base != 'BTC') continue;
+		if (market_get($exchange, $symbol, "disabled")) {
+			$market->disabled = 1;
+			$market->message = 'disabled from settings';
+		}
+
+		$coin = getdbosql('db_coins', "symbol='{$symbol}'");
+		if(!$coin) continue;
+		if(!$coin->installed && !$coin->watch) continue;
+		$market = getdbosql('db_markets', "coinid={$coin->id} and name='{$exchange}'");
+		if(!$market) continue;
+
+		$price2 = ($ticker->highest_bid + $ticker->lowest_ask)/2;
+		$market->price2 = AverageIncrement($market->price2, $price2);
+		$market->price = AverageIncrement($market->price, $ticker->highest_bid);
+		$market->pricetime = time();
+		$market->priority = -1;
+		$market->txfee = 0.2; // trade pct
+		$market->save();
+		//debuglog("$exchange: update $symbol: {$market->price} {$market->price2}");
+		if ((empty($coin->price))||(empty($coin->price2))) {
+			$coin->price = $market->price;
+			$coin->price2 = $market->price2;
+			$coin->market = $exchange;
+			$coin->save();
+		}
 	}
 }
 
@@ -1386,49 +1428,6 @@ function updateBinanceMarkets()
 	}
 }
 
-function updateBterMarkets()
-{
-	$exchange = 'bter';
-	if (exchange_get($exchange, 'disabled')) return;
-
-	$list = getdbolist('db_markets', "name LIKE '$exchange%'");
-	if (empty($list)) return;
-
-	$markets = bter_api_query('tickers');
-	if(!is_array($markets)) return;
-
-	foreach($list as $market)
-	{
-		$coin = getdbo('db_coins', $market->coinid);
-		if(!$coin) continue;
-
-		$symbol = $coin->getOfficialSymbol();
-		if (market_get($exchange, $symbol, "disabled")) {
-			$market->disabled = 1;
-			$market->message = 'disabled from settings';
-			$market->save();
-			continue;
-		}
-
-		$dbpair = strtolower($symbol).'_btc';
-		foreach ($markets as $pair => $ticker) {
-			if ($pair != $dbpair) continue;
-
-			$market->price = AverageIncrement($market->price, $ticker['buy']);
-			$market->price2 = AverageIncrement($market->price2, $ticker['avg']);
-			$market->pricetime = time();
-			if ($market->disabled < 9) $market->disabled = (floatval($ticker['vol_btc']) < 0.01);
-			$market->save();
-
-			if (empty($coin->price2)) {
-				$coin->price = $market->price;
-				$coin->price2 = $market->price2;
-				$coin->save();
-			}
-		}
-	}
-}
-
 function updateEmpoexMarkets()
 {
 	$exchange = 'empoex';
@@ -1483,13 +1482,14 @@ function updateKuCoinMarkets()
 	$list = getdbolist('db_markets', "name LIKE '$exchange%'");
 	if (empty($list)) return;
 
-	$markets = kucoin_api_query('open/symbols','market=BTC');
-	if(!kucoin_result_valid($markets) || empty($markets->data)) return;
+	$symbols = kucoin_api_query('symbols','market=BTC');
+	if(!kucoin_result_valid($symbols) || empty($symbols->data)) return;
 
-	$coininfo = NULL; //kucoin_api_query('market/open/coins');
-	if(!kucoin_result_valid($coininfo) || empty($coininfo->data)) {
-		$coininfo = NULL;
-	}
+	usleep(500);
+	$markets = kucoin_api_query('market/allTickers');
+	if(!kucoin_result_valid($markets) || empty($markets->data)) return;
+	if(!isset($markets->data->ticker) || !is_array($markets->data->ticker)) return;
+	$tickers = $markets->data->ticker;
 
 	foreach($list as $market)
 	{
@@ -1506,19 +1506,25 @@ function updateKuCoinMarkets()
 
 		$pair = strtoupper($symbol).'-BTC';
 
-		foreach ($markets->data as $ticker) {
+		$enableTrading = false;
+		foreach ($symbols->data as $sym) {
+			if (objSafeVal($sym,'symbol') != $pair) continue;
+			$enableTrading = objSafeVal($sym,'enableTrading',false);
+			break;
+		}
+
+		if ($market->disabled == $enableTrading) {
+			$market->disabled = (int) (!$enableTrading);
+			$market->save();
+			if ($market->disabled) continue;
+		}
+
+		foreach ($tickers as $ticker) {
 			if ($ticker->symbol != $pair) continue;
 			if (objSafeVal($ticker,'buy',-1) == -1) continue;
 
 			$market->price = AverageIncrement($market->price, $ticker->buy);
 			$market->price2 = AverageIncrement($market->price2, objSafeVal($ticker,'sell',$ticker->buy));
-			if (!empty($coininfo)) foreach ($coininfo->data as $info) {
-				if ($info->coin == $symbol) {
-					//todo: $market->withdrawfee = $info->withdrawMinFee;
-					break;
-				}
-			}
-			$market->txfee = $ticker->feeRate * 100; // is 0.1% for trades (0.001)
 			$market->priority = -1;
 			$market->pricetime = time();
 
